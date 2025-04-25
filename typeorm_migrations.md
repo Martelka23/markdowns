@@ -163,3 +163,42 @@ async function runMigrationsWithTryLock() {
 ```ts
 await dataSource.query(`SELECT pg_advisory_unlock(${lockKey})`);
 ```
+>Вообще, она сама освободится после возвращения подключения в connection pool. Но лучше сделать это дополнительно вручную, чтобы все точно прошло по плану.
+
+## 🎉 Финальная версия
+
+ - Выносим блокировку в отдельный runner, чтобы она не слетала после возвращения подключения в pool.
+ - Добавляем обработку исключений.
+ - Реплики, которые не выполняют миграций, ждут их завершения. После чего выполняют проверку, что все действительно было выполнено успешно.
+
+```ts
+async function runMigrationsWithTryLock() {
+	await dataSource.initialize();
+	const runner = dataSource.createQueryRunner();
+	await runner.connect();
+	
+	const lockKey = 12345678;
+	const lockResult = await runner.query(`SELECT pg_try_advisory_lock(${lockKey})`);
+	const acquired = lockResult[0]?.pg_try_advisory_lock;
+	
+	if (acquired) {
+		try {
+			await dataSource.runMigrations();
+		} catch (err) {
+			throw err;
+		} finally {
+			await runner.query(`SELECT pg_advisory_unlock(${lockKey})`);
+		}
+	} else {
+		await dataSource.query(`SELECT pg_advisory_lock(${lockKey})`);
+		await dataSource.query(`SELECT pg_advisory_unlock(${lockKey})`);
+		
+		const hasPending = await dataSource.showMigrations();
+		if (hasPending) {
+			throw new Error('Нужная миграция не найдена');
+		}
+	}
+	
+	await dataSource.destroy();
+}
+```
